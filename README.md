@@ -54,7 +54,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/xiaotianwm/socks5/main/instal
 ### 1. 下载源码
 
 ```bash
-git clone (https://github.com/xiaotianwm/socks5.git)
+git clone https://github.com/xiaotianwm/socks5.git
 cd socks5
 
 ```
