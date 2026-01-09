@@ -54,7 +54,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/xiaotianwm/socks5/main/instal
 ### 1. 下载源码
 
 ```bash
-git clone [https://github.com/xiaotianwm/socks5.git](https://github.com/xiaotianwm/socks5.git)
+git clone (https://github.com/xiaotianwm/socks5.git)
 cd socks5
 
 ```
@@ -126,6 +126,3 @@ systemctl daemon-reload
 * **SOCKS5 程序**：编译自 `main.go`，仅保留核心转发逻辑，去除所有控制台输出和日志记录，适合静默运行。
 * **BBR 脚本**：自动开启 BBR 拥塞控制，调整 TCP 窗口大小、缓冲区及队列长度，优化高并发与大带宽环境下的连接稳定性。
 
-```
-
-```
