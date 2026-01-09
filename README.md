@@ -21,7 +21,7 @@
 在安装服务前，建议先运行此脚本以优化服务器网络性能：
 
 ```bash
-bash <(wget -qO- [https://raw.githubusercontent.com/xiaotianwm/socks5/main/bbr.sh](https://raw.githubusercontent.com/xiaotianwm/socks5/main/bbr.sh))
+bash <(wget -qO- https://raw.githubusercontent.com/xiaotianwm/socks5/main/bbr.sh)
 
 ```
 
@@ -32,14 +32,14 @@ bash <(wget -qO- [https://raw.githubusercontent.com/xiaotianwm/socks5/main/bbr.s
 **语法：**
 
 ```bash
-bash <(wget -qO- [https://raw.githubusercontent.com/xiaotianwm/socks5/main/install.sh](https://raw.githubusercontent.com/xiaotianwm/socks5/main/install.sh)) <端口> <用户名> <密码>
+bash <(wget -qO- https://raw.githubusercontent.com/xiaotianwm/socks5/main/install.sh) <端口> <用户名> <密码>
 
 ```
 
 **示例 (开启 2080 端口，账号 admin，密码 123456)：**
 
 ```bash
-bash <(wget -qO- [https://raw.githubusercontent.com/xiaotianwm/socks5/main/install.sh](https://raw.githubusercontent.com/xiaotianwm/socks5/main/install.sh)) 2080 admin 123456
+bash <(wget -qO- https://raw.githubusercontent.com/xiaotianwm/socks5/main/install.sh) 2080 admin 123456
 
 ```
 
