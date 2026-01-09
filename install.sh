@@ -2,7 +2,7 @@
 
 # --- 配置区域 ---
 # 请将下面的 URL 替换为你 GitHub 上编译好的二进制文件的 RAW 下载链接
-DOWNLOAD_URL="https://raw.githubusercontent.com/xiaotianwm/socks5/refs/heads/main/socks5-server"
+DOWNLOAD_URL="https://github.com/xiaotianwm/socks5/raw/main/socks5-server"
 INSTALL_PATH="/usr/local/bin/socks5-server"
 SERVICE_NAME="mysocks5"
 
