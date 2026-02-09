@@ -1,0 +1,472 @@
+#!/bin/bash
+
+# ====================================================
+# Xray-core Trojan 部署脚本 (Ultimate V5.0 Optimized)
+# 更新日志: 
+# - 修复 /etc/fstab 和 sysctl 重复追加的问题 (幂等性)
+# - 修复证书文件权限导致 Xray 无法读取的问题
+# - 增加端口占用强制清理逻辑
+# - 优化回落域名配置，减少特征
+# ====================================================
+
+# --- 全局配置 ---
+XRAY_CONFIG_DIR="/usr/local/etc/xray"
+XRAY_CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json"
+XRAY_CERT_DIR="${XRAY_CONFIG_DIR}/cert"
+ACME_SH_DIR="$HOME/.acme.sh"
+LOG_DIR="/var/log/xray"
+
+# 默认运行 Xray 的用户 (通常官方脚本安装后是 nobody 或 xray，这里统一用 nobody)
+XRAY_USER="nobody"
+XRAY_GROUP="nogroup"
+
+# 颜色
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[36m"
+PLAIN="\033[0m"
+
+# --- 辅助函数 ---
+
+check_root() {
+    [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 用户运行此脚本！${PLAIN}" && exit 1
+}
+
+check_sys() {
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        RELEASE=$ID
+    else
+        echo -e "${RED}系统未识别，仅支持 CentOS/Debian/Ubuntu/Alpine${PLAIN}"
+        exit 1
+    fi
+}
+
+# --- 1. 依赖与环境 ---
+
+install_dependencies() {
+    echo -e "${YELLOW}[1/8] 安装系统依赖...${PLAIN}"
+    PACKAGES="curl wget socat jq tar lsof openssl cron ca-certificates dnsutils qrencode"
+    
+    case "${RELEASE}" in
+        centos|rhel|fedora|almalinux|rocky)
+            CMD="yum"
+            [[ "${RELEASE}" == "fedora" ]] && CMD="dnf"
+            $CMD update -y && $CMD install -y $PACKAGES bind-utils
+            ;;
+        debian|ubuntu|kali)
+            apt update -y && apt install -y $PACKAGES
+            ;;
+        alpine)
+            apk update && apk add $PACKAGES bash gcompat coreutils
+            # Alpine 下 nobody 组名为 nobody
+            XRAY_GROUP="nobody" 
+            ;;
+    esac
+
+    # 确保 Cron 运行
+    if [[ "${RELEASE}" == "alpine" ]]; then
+        rc-service crond start
+    else
+        systemctl enable cron --now 2>/dev/null || systemctl enable crond --now 2>/dev/null
+    fi
+}
+
+setup_swap() {
+    echo -e "${YELLOW}[1.1/8] 检查并配置 SWAP...${PLAIN}"
+    MEM=$(free -m | awk '/Mem:/ { print $2 }')
+    SWAP=$(free -m | awk '/Swap:/ { print $2 }')
+    
+    if [[ $MEM -le 1024 && $SWAP -le 1024 ]]; then
+        if [[ ! -f /swapfile ]]; then
+            echo -e "${BLUE}检测到小内存系统，正在创建 1GB Swap 文件...${PLAIN}"
+            dd if=/dev/zero of=/swapfile bs=1M count=1024
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+        fi
+        
+        # 幂等性检查：防止重复写入 fstab
+        if ! grep -q "/swapfile" /etc/fstab; then
+            echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+            echo -e "${GREEN}Swap 创建并挂载成功。${PLAIN}"
+        else
+             echo -e "${GREEN}Swap 配置已存在于 fstab，跳过写入。${PLAIN}"
+        fi
+    else
+        echo -e "${GREEN}内存/Swap 充足，跳过。${PLAIN}"
+    fi
+}
+
+# --- 2. 配置收集 ---
+
+get_config() {
+    echo -e "${YELLOW}[2/8] 配置参数...${PLAIN}"
+
+    # 保留旧配置逻辑...
+    if [[ -f "${XRAY_CONFIG_FILE}" ]]; then
+        OLD_UUID=$(grep "password" ${XRAY_CONFIG_FILE} | awk -F '"' '{print $4}' | head -n 1)
+        if [[ -n "$OLD_UUID" ]]; then
+            echo -e "${BLUE}检测到旧配置文件，UUID: $OLD_UUID${PLAIN}"
+            read -p "是否保留旧配置? (y/n, 默认 y): " KEEP_CFG
+            [[ -z "$KEEP_CFG" ]] && KEEP_CFG="y"
+            if [[ "$KEEP_CFG" == "y" ]]; then
+                UUID=$OLD_UUID
+                OLD_PORT=$(grep "port" ${XRAY_CONFIG_FILE} | head -n 1 | tr -cd "[0-9]")
+                [[ -n "$OLD_PORT" ]] && PORT=$OLD_PORT
+            fi
+        fi
+    fi
+
+    if [[ -z "$PORT" ]]; then
+        if [[ -n "$1" ]]; then
+            PORT=$1
+        else
+            read -p "请输入 Trojan 端口 (默认 443): " PORT
+            [[ -z "$PORT" ]] && PORT=443
+        fi
+    fi
+
+    if [[ -n "$2" ]]; then
+        DOMAIN=$2
+    else
+        while true; do
+            read -p "请输入绑定的域名: " DOMAIN
+            [[ -z "$DOMAIN" ]] && echo -e "${RED}域名不能为空！${PLAIN}" || break
+        done
+    fi
+
+    # 增加回落伪装站点的自定义，避免特征过强
+    read -p "请输入伪装回落地址 (默认 www.microsoft.com，建议改为其他不相关的网站): " FALLBACK_DEST
+    [[ -z "$FALLBACK_DEST" ]] && FALLBACK_DEST="www.microsoft.com"
+    # 自动补全端口
+    if [[ "$FALLBACK_DEST" != *:* ]]; then
+        FALLBACK_DEST="${FALLBACK_DEST}:80"
+    fi
+
+    # 域名解析检查
+    echo -e "${BLUE}正在检查域名解析...${PLAIN}"
+    LOCAL_IP=$(curl -s4 https://api.ip.sb/ip --connect-timeout 5 || curl -s4 ifconfig.me)
+    DOMAIN_IP=$(dig +short ${DOMAIN} | head -n 1)
+    
+    if [[ -z "$DOMAIN_IP" ]]; then
+        echo -e "${YELLOW}警告: 无法解析域名 IP，可能是 DNS 延迟。${PLAIN}"
+    elif [[ "$LOCAL_IP" != "$DOMAIN_IP" ]]; then
+        echo -e "${RED}警告: 域名 IP ($DOMAIN_IP) 与本机 IP ($LOCAL_IP) 不一致！${PLAIN}"
+        read -p "是否强制继续? (y/n): " FORCE
+        [[ "$FORCE" != "y" ]] && exit 1
+    fi
+}
+
+# --- 3. 证书处理 ---
+
+acme_cert() {
+    echo -e "${YELLOW}[3/8] 准备申请 SSL 证书...${PLAIN}"
+    mkdir -p ${XRAY_CERT_DIR}
+
+    # 端口释放逻辑
+    if lsof -i:80 | grep -q LISTEN; then
+        echo -e "${YELLOW}检测到 80 端口被占用，尝试释放...${PLAIN}"
+        # 优先停止常见 Web 服务
+        systemctl stop nginx 2>/dev/null
+        systemctl stop apache2 2>/dev/null
+        systemctl stop caddy 2>/dev/null
+        
+        # 再次检查，如果还在占用则强制 Kill
+        if lsof -i:80 | grep -q LISTEN; then
+            lsof -t -i:80 | xargs kill -9
+            echo -e "${BLUE}已强制终止占用 80 端口的进程。${PLAIN}"
+        fi
+    fi
+
+    if [[ ! -f "${ACME_SH_DIR}/acme.sh" ]]; then
+        curl https://get.acme.sh | sh -s email=admin@${DOMAIN}
+    fi
+    
+    # 证书申请 (增加重试逻辑)
+    ${ACME_SH_DIR}/acme.sh --set-default-ca --server letsencrypt
+    ${ACME_SH_DIR}/acme.sh --issue -d "$DOMAIN" --standalone --keylength ec-256 --force
+    
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}Let's Encrypt 失败，尝试 ZeroSSL...${PLAIN}"
+        ${ACME_SH_DIR}/acme.sh --set-default-ca --server zerossl
+        ${ACME_SH_DIR}/acme.sh --register-account -m admin@${DOMAIN}
+        ${ACME_SH_DIR}/acme.sh --issue -d "$DOMAIN" --standalone --keylength ec-256 --force
+        if [[ $? -ne 0 ]]; then
+            echo -e "${RED}证书申请失败！请检查 80 端口是否开放，或防火墙设置。${PLAIN}"
+            exit 1
+        fi
+    fi
+
+    # 安装证书 - 关键修改：权限控制
+    # 确保证书的所有者是 xray 运行的用户 (nobody)，否则 xray 无权读取导致启动失败
+    ${ACME_SH_DIR}/acme.sh --install-cert -d "$DOMAIN" --ecc \
+        --fullchain-file ${XRAY_CERT_DIR}/fullchain.crt \
+        --key-file       ${XRAY_CERT_DIR}/private.key \
+        --reloadcmd      "chown -R ${XRAY_USER}:${XRAY_GROUP} ${XRAY_CERT_DIR} && systemctl restart xray"
+
+    # 首次安装后的权限修正
+    chown -R ${XRAY_USER}:${XRAY_GROUP} ${XRAY_CERT_DIR}
+    chmod 644 ${XRAY_CERT_DIR}/fullchain.crt
+    chmod 600 ${XRAY_CERT_DIR}/private.key
+}
+
+# --- 4. 安装与配置 ---
+
+install_xray() {
+    echo -e "${YELLOW}[4/8] 安装/更新 Xray-Core...${PLAIN}"
+    # 使用官方最新安装脚本
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+}
+
+config_xray() {
+    echo -e "${YELLOW}[5/8] 生成配置文件...${PLAIN}"
+    [[ -z "$UUID" ]] && UUID=$(xray uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+
+    cat > ${XRAY_CONFIG_FILE} <<EOF
+{
+  "log": {
+    "loglevel": "warning",
+    "access": "${LOG_DIR}/access.log",
+    "error": "${LOG_DIR}/error.log"
+  },
+  "inbounds": [
+    {
+      "port": $PORT,
+      "protocol": "trojan",
+      "settings": {
+        "clients": [
+          {
+            "password": "$UUID",
+            "email": "user@${DOMAIN}"
+          }
+        ],
+        "fallbacks": [
+          {
+            "dest": "$FALLBACK_DEST",
+            "xver": 1
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "alpn": [
+            "h2",
+            "http/1.1"
+          ],
+          "certificates": [
+            {
+              "certificateFile": "${XRAY_CERT_DIR}/fullchain.crt",
+              "keyFile": "${XRAY_CERT_DIR}/private.key"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {}
+    }
+  ]
+}
+EOF
+}
+
+# --- 5. 系统优化 ---
+
+optimize_sys() {
+    echo -e "${YELLOW}[6/8] 系统优化...${PLAIN}"
+    
+    # BBR & 调优 - 幂等性检查
+    CONF_FILE="/etc/sysctl.conf"
+    UPDATED=0
+    
+    if ! grep -q "net.core.default_qdisc=fq" $CONF_FILE; then
+        echo "net.core.default_qdisc=fq" >> $CONF_FILE
+        UPDATED=1
+    fi
+    if ! grep -q "net.ipv4.tcp_congestion_control=bbr" $CONF_FILE; then
+        echo "net.ipv4.tcp_congestion_control=bbr" >> $CONF_FILE
+        UPDATED=1
+    fi
+    
+    if [[ $UPDATED -eq 1 ]]; then
+        sysctl -p >/dev/null 2>&1
+        echo -e "${GREEN}BBR 已开启。${PLAIN}"
+    else
+        echo -e "${GREEN}BBR 配置已存在，跳过。${PLAIN}"
+    fi
+
+    # 时区
+    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+
+    # Logrotate
+    cat > /etc/logrotate.d/xray <<EOF
+${LOG_DIR}/*.log {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+EOF
+}
+
+start_firewall() {
+    echo -e "${YELLOW}[7/8] 配置防火墙...${PLAIN}"
+    # 简单的防火墙处理
+    if command -v ufw >/dev/null; then
+        ufw allow 80/tcp
+        ufw allow 443/tcp
+        ufw allow ${PORT}/tcp
+    elif command -v firewall-cmd >/dev/null; then
+        firewall-cmd --zone=public --add-port=80/tcp --permanent
+        firewall-cmd --zone=public --add-port=443/tcp --permanent
+        firewall-cmd --zone=public --add-port=${PORT}/tcp --permanent
+        firewall-cmd --reload
+    else
+        # 尝试 iptables，但不强求，避免破坏现有的复杂规则
+        if command -v iptables >/dev/null; then
+             iptables -I INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null
+             iptables -I INPUT -p tcp --dport 443 -j ACCEPT 2>/dev/null
+             iptables -I INPUT -p tcp --dport ${PORT} -j ACCEPT 2>/dev/null
+        fi
+    fi
+}
+
+start_xray() {
+    # 修正日志权限
+    mkdir -p ${LOG_DIR}
+    chown -R ${XRAY_USER}:${XRAY_GROUP} ${LOG_DIR}
+    
+    systemctl restart xray
+    systemctl enable xray
+}
+
+# --- 6. 展示与管理 ---
+
+show_result() {
+    sleep 2
+    if systemctl is-active --quiet xray; then
+        TROJAN_LINK="trojan://${UUID}@${DOMAIN}:${PORT}?security=tls&alpn=h2,http%2F1.1&headerType=none&type=tcp#${DOMAIN}_Trojan"
+        
+        clear
+        echo "========================================================="
+        echo -e "${GREEN} Xray-Trojan 部署成功 (V5.0 Optimized)! ${PLAIN}"
+        echo "========================================================="
+        echo -e " 域名:        ${BLUE}${DOMAIN}${PLAIN}"
+        echo -e " 端口:        ${BLUE}${PORT}${PLAIN}"
+        echo -e " 密码 (UUID): ${BLUE}${UUID}${PLAIN}"
+        echo -e " 伪装回落:    ${YELLOW}${FALLBACK_DEST}${PLAIN}"
+        echo "========================================================="
+        echo -e " 链接: ${GREEN}${TROJAN_LINK}${PLAIN}"
+        echo "========================================================="
+        qrencode -t ANSIUTF8 "${TROJAN_LINK}"
+        echo "========================================================="
+    else
+        echo -e "${RED}Xray 启动失败!${PLAIN}"
+        echo -e "请检查日志: ${YELLOW}journalctl -u xray -e --no-pager${PLAIN}"
+        echo -e "可能原因: 1. 端口被占用 2. 证书权限不足 3. 配置文件格式错误"
+    fi
+}
+
+uninstall_xray() {
+    echo -e "${RED}确定要卸载 Xray 吗? [y/N]${PLAIN}"
+    read -r res
+    [[ "$res" != "y" && "$res" != "Y" ]] && exit 0
+    
+    systemctl stop xray
+    systemctl disable xray
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove
+    rm -rf ${XRAY_CONFIG_DIR}
+    rm -rf ${LOG_DIR}
+    rm -f /etc/logrotate.d/xray
+    echo -e "${GREEN}卸载完成。${PLAIN}"
+}
+
+# --- 菜单逻辑 ---
+
+menu() {
+    clear
+    echo "================================================="
+    echo "       Xray-Trojan 管理脚本 (V5.0)              "
+    echo "================================================="
+    echo " 1. 安装 / 更新 Xray (Trojan)"
+    echo " 2. 查看当前配置 / 链接"
+    echo " 3. 重启 Xray 服务"
+    echo " 4. 卸载 Xray"
+    echo " 0. 退出"
+    echo "================================================="
+    read -p " 请输入选项 [0-4]: " num
+
+    case "$num" in
+        1)
+            check_root
+            check_sys
+            install_dependencies
+            setup_swap
+            get_config $ARG_PORT $ARG_DOMAIN
+            acme_cert
+            install_xray
+            config_xray
+            optimize_sys
+            start_firewall
+            start_xray
+            show_result
+            ;;
+        2)
+            if [[ -f "${XRAY_CONFIG_FILE}" ]]; then
+                # 优化读取逻辑
+                DOMAIN=$(grep "email" ${XRAY_CONFIG_FILE} | awk -F '@' '{print $2}' | awk -F '"' '{print $1}' | head -1)
+                UUID=$(grep "password" ${XRAY_CONFIG_FILE} | awk -F '"' '{print $4}' | head -n 1)
+                PORT=$(grep "\"port\":" ${XRAY_CONFIG_FILE} | head -n 1 | tr -cd "[0-9]")
+                FALLBACK_DEST=$(grep "dest" ${XRAY_CONFIG_FILE} | head -n 1 | awk -F '"' '{print $4}')
+                show_result
+            else
+                echo -e "${RED}未找到配置文件!${PLAIN}"
+            fi
+            ;;
+        3)
+            systemctl restart xray
+            echo -e "${GREEN}Xray 重启完成。${PLAIN}"
+            ;;
+        4)
+            uninstall_xray
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}请输入正确的数字 [0-4]${PLAIN}"
+            ;;
+    esac
+}
+
+# --- 入口 ---
+
+ARG_PORT=$1
+ARG_DOMAIN=$2
+
+if [[ -n "$ARG_PORT" && -n "$ARG_DOMAIN" ]]; then
+    check_root
+    check_sys
+    install_dependencies
+    setup_swap
+    get_config $ARG_PORT $ARG_DOMAIN
+    acme_cert
+    install_xray
+    config_xray
+    optimize_sys
+    start_firewall
+    start_xray
+    show_result
+else
+    menu
+fi
