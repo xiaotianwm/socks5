@@ -1,0 +1,394 @@
+#!/bin/bash
+
+# ====================================================
+# Xray-core 极简部署脚本 (VLESS+WS 纯后端架构) - 最终优化版
+# 适用场景: 前端使用 Nginx 或 Nginx Proxy Manager 处理 TLS
+# ====================================================
+
+# --- 全局配置 ---
+XRAY_CONFIG_DIR="/usr/local/etc/xray"
+XRAY_CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json"
+LOG_DIR="/var/log/xray"
+XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+
+# 颜色
+RED="\033[31m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[36m"
+PLAIN="\033[0m"
+
+# --- 辅助函数 ---
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}错误: 必须使用 root 用户运行此脚本！${PLAIN}"
+        exit 1
+    fi
+}
+
+check_sys() {
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        RELEASE="${ID} ${ID_LIKE}"
+        if echo "$RELEASE" | grep -qi "alpine"; then
+            echo -e "${RED}抱歉，本脚本高度依赖 systemd，暂不支持 Alpine Linux。${PLAIN}"
+            exit 1
+        fi
+    else
+        echo -e "${RED}系统未识别，仅支持主流 Systemd 系统${PLAIN}"
+        exit 1
+    fi
+}
+
+ensure_jq() {
+    if ! command -v jq >/dev/null 2>&1; then
+        echo -e "${YELLOW}未检测到 jq，正在自动安装...${PLAIN}"
+        if command -v apt-get >/dev/null 2>&1; then
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -y -qq >/dev/null 2>&1
+            apt-get install -y -qq jq >/dev/null 2>&1 
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y epel-release >/dev/null 2>&1
+            dnf install -y jq >/dev/null 2>&1
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y epel-release >/dev/null 2>&1
+            yum install -y jq >/dev/null 2>&1
+        fi
+    fi
+}
+
+# 统一下载并执行 Xray 官方脚本，避免网络不通导致静默失败
+run_xray_script() {
+    local action=$1
+    local tmp_script="/tmp/xray-install.sh"
+    
+    if ! curl -sSL -o "${tmp_script}" "${XRAY_INSTALL_URL}"; then
+        echo -e "${RED}下载 Xray 官方脚本失败，请检查网络连通性 (如 GitHub 是否被阻断)！${PLAIN}"
+        return 1
+    fi
+    
+    bash "${tmp_script}" "${action}"
+    rm -f "${tmp_script}"
+}
+
+# --- 1. 依赖与环境 ---
+
+install_dependencies() {
+    echo -e "${YELLOW}[1/5] 安装系统依赖...${PLAIN}"
+    
+    local PACKAGES="curl wget jq tar lsof ca-certificates qrencode uuid-runtime"
+    
+    # 修复了 exit 1 导致跳出脚本的问题，改为 return 1 退回菜单
+    if command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y -qq || return 1
+        apt-get install -y -qq $PACKAGES || { echo -e "${RED}依赖安装失败！请检查网络或软件源。${PLAIN}"; return 1; }
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf update -y || return 1
+        dnf install -y epel-release || return 1
+        dnf install -y $PACKAGES || { echo -e "${RED}依赖安装失败！请检查网络或软件源。${PLAIN}"; return 1; }
+    elif command -v yum >/dev/null 2>&1; then
+        yum update -y || return 1
+        yum install -y epel-release || return 1
+        yum install -y $PACKAGES || { echo -e "${RED}依赖安装失败！请检查网络或软件源。${PLAIN}"; return 1; }
+    else
+        echo -e "${RED}未找到支持的包管理器 (apt/yum/dnf)，依赖安装失败！${PLAIN}"
+        return 1
+    fi
+}
+
+setup_swap() {
+    echo -e "${YELLOW}[1.1/5] 检查并配置 SWAP...${PLAIN}"
+    local MEM SWAP
+    MEM=$(free -m | awk '/^Mem:/ { print $2 }')
+    SWAP=$(free -m | awk '/^Swap:/ { print $2 }')
+    
+    if [[ "$MEM" =~ ^[0-9]+$ ]] && [[ "$SWAP" =~ ^[0-9]+$ ]] && [[ $MEM -le 1024 && $SWAP -le 1024 ]]; then
+        if [[ ! -f /swapfile ]]; then
+            echo -e "${BLUE}检测到小内存系统，正在创建 1GB Swap 文件...${PLAIN}"
+            
+            touch /swapfile
+            chmod 600 /swapfile
+            
+            if ! fallocate -l 1G /swapfile 2>/dev/null; then
+                dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none || true
+            fi
+            
+            local SWAP_SIZE=$(stat -c%s "/swapfile" 2>/dev/null || stat -f%z "/swapfile" 2>/dev/null)
+            if [[ -s /swapfile ]] && [[ "$SWAP_SIZE" -gt 1048576 ]]; then
+                mkswap /swapfile >/dev/null 2>&1
+                swapon /swapfile
+                if ! grep -qw "/swapfile" /etc/fstab; then
+                    echo "/swapfile none swap sw 0 0" >> /etc/fstab
+                fi
+            else
+                echo -e "${RED}[警告] 磁盘或空间不足，Swap 创建失败，跳过...${PLAIN}"
+                rm -f /swapfile
+            fi
+        fi
+    fi
+    return 0
+}
+
+# --- 2. 配置收集 ---
+
+get_config() {
+    echo -e "${YELLOW}[2/5] 配置 VLESS+WS 后端参数...${PLAIN}"
+    
+    DOMAIN=""
+    while [[ -z "$DOMAIN" ]]; do
+        read -r -p "请输入你要通过前端代理绑定的公网域名 (仅用于生成分享链接): " DOMAIN
+    done
+    
+    read -r -p "请输入 Xray 本地监听端口 (默认 10000): " LOCAL_PORT
+    LOCAL_PORT=${LOCAL_PORT:-10000}
+    if ! [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]] || [ "$LOCAL_PORT" -lt 1 ] || [ "$LOCAL_PORT" -gt 65535 ]; then
+        echo -e "${RED}端口输入无效，将使用默认端口 10000${PLAIN}"
+        LOCAL_PORT=10000
+    fi
+    
+    read -r -p "请输入 WebSocket 伪装路径 (默认 /ray): " WS_PATH
+    WS_PATH=${WS_PATH:-"/ray"}
+    
+    # 修复短路陷阱：改用标准的 if 语句
+    if [[ "${WS_PATH}" != /* ]]; then
+        WS_PATH="/${WS_PATH}"
+    fi
+    
+    return 0
+}
+
+# --- 3. 安装与配置 ---
+
+install_xray() {
+    echo -e "${YELLOW}[3/5] 安装/更新 Xray-Core...${PLAIN}"
+    run_xray_script "install"
+}
+
+config_xray() {
+    echo -e "${YELLOW}[4/5] 生成 VLESS+WS 配置文件...${PLAIN}"
+    
+    UUID=$(/usr/local/bin/xray uuid 2>/dev/null)
+    if [[ -z "$UUID" ]]; then
+        UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen)
+    fi
+    
+    mkdir -p "${XRAY_CONFIG_DIR}"
+    
+    cat > "${XRAY_CONFIG_FILE}" <<EOF
+{
+  "log": { "loglevel": "warning", "access": "${LOG_DIR}/access.log", "error": "${LOG_DIR}/error.log" },
+  "inbounds": [
+    {
+      "port": $LOCAL_PORT,
+      "listen": "0.0.0.0",
+      "protocol": "vless",
+      "settings": {
+        "clients": [ { "id": "$UUID", "level": 0 } ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": { "path": "$WS_PATH" }
+      }
+    }
+  ],
+  "outbounds": [ { "protocol": "freedom", "settings": {} } ]
+}
+EOF
+}
+
+# --- 4. 系统优化与启动 ---
+
+optimize_sys() {
+    echo -e "${YELLOW}[5/5] 系统优化与服务启动...${PLAIN}"
+    local SYSCTL_CONF="/etc/sysctl.d/99-xray-bbr.conf"
+    cat > "${SYSCTL_CONF}" <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+    modprobe tcp_bbr 2>/dev/null
+    sysctl --system >/dev/null 2>&1
+    
+    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+}
+
+start_xray() {
+    mkdir -p "${LOG_DIR}"
+    
+    local REAL_USER
+    REAL_USER=$(awk -F= '/^User=/ {print $2}' /etc/systemd/system/xray.service 2>/dev/null)
+    [[ -z "$REAL_USER" ]] && REAL_USER="nobody"
+    
+    chown -R "${REAL_USER}" "${LOG_DIR}" 2>/dev/null || true
+    chown -R "${REAL_USER}" "${XRAY_CONFIG_DIR}" 2>/dev/null || true
+    
+    systemctl daemon-reload
+    systemctl restart xray
+    systemctl enable xray >/dev/null 2>&1
+}
+
+# --- 5. 展示与管理 ---
+
+show_result() {
+    sleep 2
+    local ENCODED_WS_PATH="${WS_PATH//\//%2F}"
+    local LINK="vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&sni=${DOMAIN}&type=ws&host=${DOMAIN}&path=${ENCODED_WS_PATH}#${DOMAIN}_VLESS"
+    
+    clear
+    echo -e "${GREEN}=========================================================${PLAIN}"
+    echo -e "${GREEN}                Xray VLESS+WS 后端配置信息                 ${PLAIN}"
+    echo -e "${GREEN}=========================================================${PLAIN}"
+    
+    if ! systemctl is-active --quiet xray; then
+        echo -e "${RED}[警告] Xray 服务当前未正常运行，请检查日志: journalctl -u xray -e --no-pager${PLAIN}"
+        echo -e "${GREEN}=========================================================${PLAIN}"
+    fi
+
+    echo -e " 客户端连接信息 (请确保前端反向代理已配置好 SSL):"
+    echo -e " 域名:        ${BLUE}${DOMAIN}${PLAIN}"
+    echo -e " 端口:        ${BLUE}443${PLAIN}"
+    echo -e " 用户 (UUID): ${BLUE}${UUID}${PLAIN}"
+    echo -e " WS 路径:     ${BLUE}${WS_PATH}${PLAIN}"
+    echo -e " 链接: ${GREEN}${LINK}${PLAIN}"
+    echo -e "${GREEN}=========================================================${PLAIN}"
+    
+    echo -e "${YELLOW}>> 接下来，请在你的 Nginx Proxy Manager (NPM) 进行如下配置: <<${PLAIN}"
+    echo ""
+    echo "1. 添加/编辑你的 Proxy Host (代理 ${DOMAIN})，并申请开启 SSL。"
+    echo "2. 进入 'Custom Locations' (自定义路径) 标签页。"
+    echo -e "3. Location 填入: ${YELLOW}${WS_PATH}${PLAIN}"
+    echo -e "4. Forward Hostname / IP 填入: ${YELLOW}127.0.0.1 (若 NPM 在 Docker 中，建议填入内网 IP)${PLAIN}"
+    echo -e "5. Forward Port 填入: ${YELLOW}${LOCAL_PORT}${PLAIN}"
+    echo -e "6. ${YELLOW}强烈建议: 直接在 NPM 的 Details 标签页勾选 'WebSockets Support'。${PLAIN}"
+    echo -e "7. (可选) 若你未勾选上述开关，才需要在 Advanced 中手动填入以下代码:"
+    echo -e "${BLUE}   proxy_http_version 1.1;${PLAIN}"
+    echo -e "${BLUE}   proxy_set_header Upgrade \$http_upgrade;${PLAIN}"
+    echo -e "${BLUE}   proxy_set_header Connection \"upgrade\";${PLAIN}"
+    echo -e "${BLUE}   proxy_set_header Host \$http_host;${PLAIN}"
+    echo -e "${GREEN}=========================================================${PLAIN}"
+
+    if command -v qrencode >/dev/null 2>&1; then
+        echo -e "${YELLOW}扫描下方二维码快速导入节点:${PLAIN}"
+        qrencode -t ANSIUTF8 "${LINK}"
+        echo -e "${GREEN}=========================================================${PLAIN}"
+    fi
+}
+
+view_config() {
+    if [[ -f "${XRAY_CONFIG_FILE}" ]]; then
+        ensure_jq
+        UUID=$(jq -r '.inbounds[0].settings.clients[0].id' "${XRAY_CONFIG_FILE}")
+        
+        if [[ -z "$UUID" || "$UUID" == "null" ]]; then
+            echo -e "${RED}配置文件解析失败或数据损坏，请尝试重新安装！${PLAIN}"
+            return
+        fi
+        
+        LOCAL_PORT=$(jq -r '.inbounds[0].port' "${XRAY_CONFIG_FILE}")
+        WS_PATH=$(jq -r '.inbounds[0].streamSettings.wsSettings.path' "${XRAY_CONFIG_FILE}")
+        
+        read -r -p "请输入当前绑定的公网域名以生成分享链接 (留空默认 your-domain.com): " DOMAIN
+        [[ -z "$DOMAIN" ]] && DOMAIN="your-domain.com"
+        show_result
+    else
+        echo -e "${RED}未找到配置文件! 请先执行安装。${PLAIN}"
+    fi
+}
+
+update_xray() {
+    if systemctl list-unit-files | grep -qw xray.service || [[ -f "${XRAY_CONFIG_FILE}" ]]; then
+        echo -e "${YELLOW}开始更新 Xray 内核...${PLAIN}"
+        run_xray_script "install"
+        systemctl restart xray
+        echo -e "${GREEN}Xray 内核更新完成，服务已重启。${PLAIN}"
+    else
+        echo -e "${RED}未检测到 Xray 运行环境！请先选择 [1] 执行安装。${PLAIN}"
+    fi
+}
+
+uninstall_xray() {
+    echo -e "${RED}确定要卸载 Xray 吗? [y/N]${PLAIN}"
+    read -r res
+    [[ "$res" != "y" && "$res" != "Y" ]] && return
+    
+    if systemctl list-unit-files | grep -qw xray.service; then
+        systemctl stop xray
+        systemctl disable xray
+        systemctl daemon-reload
+    fi
+    
+    run_xray_script "remove"
+    rm -rf "${XRAY_CONFIG_DIR}"
+    rm -rf "${LOG_DIR}"
+    rm -f /etc/sysctl.d/99-xray-bbr.conf
+    
+    # 修复了暴力卸载 swap 的问题，增加交互询问
+    if grep -qw "/swapfile" /etc/fstab; then
+        read -r -p "检测到系统存在 /swapfile，是否一并清理？(若非本脚本创建请选 N) [y/N]: " rm_swap
+        if [[ "$rm_swap" == "y" || "$rm_swap" == "Y" ]]; then
+            sed -i '/\/swapfile/d' /etc/fstab
+            swapoff /swapfile 2>/dev/null
+            rm -f /swapfile
+            echo -e "${YELLOW}已清理关联的 Swap 文件。${PLAIN}"
+        fi
+    fi
+    
+    echo -e "${GREEN}卸载完成，清理完毕。${PLAIN}"
+}
+
+# --- 菜单逻辑 ---
+
+menu() {
+    while true; do
+        clear
+        echo "================================================="
+        echo "        Xray VLESS+WS 极简后端管理脚本           "
+        echo "================================================="
+        echo " 1. 一键安装 Xray 后端环境"
+        echo " 2. 查看当前配置信息"
+        echo " 3. 重启 Xray 服务"
+        echo " 4. 更新 Xray 内核"
+        echo " 5. 卸载 Xray"
+        echo " 0. 退出"
+        echo "================================================="
+        read -r -p " 请输入选项 [0-5]: " num
+
+        case "$num" in
+            1)
+                install_dependencies && setup_swap && \
+                get_config && install_xray && config_xray && \
+                optimize_sys && start_xray && show_result
+                ;;
+            2)
+                view_config
+                ;;
+            3)
+                systemctl restart xray
+                echo -e "${GREEN}Xray 重启完成。${PLAIN}"
+                ;;
+            4)
+                update_xray
+                ;;
+            5) 
+                uninstall_xray 
+                ;;
+            0) 
+                echo -e "${GREEN}退出脚本。${PLAIN}"
+                exit 0 
+                ;;
+            *) 
+                echo -e "${RED}请输入正确的数字 [0-5]${PLAIN}" 
+                ;;
+        esac
+        
+        echo ""
+        read -n 1 -s -r -p "按任意键返回主菜单..."
+    done
+}
+
+check_root
+check_sys
+menu
