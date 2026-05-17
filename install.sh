@@ -1,60 +1,83 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# --- 配置区域 ---
-# 请将下面的 URL 替换为你 GitHub 上编译好的二进制文件的 RAW 下载链接
-DOWNLOAD_URL="https://github.com/xiaotianwm/socks5/raw/main/socks5-server"
-INSTALL_PATH="/usr/local/bin/socks5-server"
-SERVICE_NAME="mysocks5"
+DOWNLOAD_URL="${DOWNLOAD_URL:-https://github.com/xiaotianwm/socks5/raw/main/socks5-server}"
+INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin/socks5-server}"
+SERVICE_NAME="${SERVICE_NAME:-mysocks5}"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
-# 检查是否以 root 运行
-if [ "$EUID" -ne 0 ]; then
-  echo "请使用 root 权限运行此脚本 (sudo bash install.sh ...)"
+usage() {
+  echo "Usage: bash install.sh <port> <username> <password>"
+  echo "Example: bash install.sh 1080 admin strong-password"
+}
+
+if [ "${EUID}" -ne 0 ]; then
+  echo "Please run as root: sudo bash install.sh <port> <username> <password>" >&2
   exit 1
 fi
 
-# 检查参数
 if [ "$#" -ne 3 ]; then
-    echo "使用方法: bash install.sh <端口> <用户名> <密码>"
-    echo "示例: bash install.sh 1080 myuser mypass123"
-    exit 1
+  usage
+  exit 1
 fi
 
-PORT=$1
-USER=$2
-PASS=$3
+PORT="$1"
+USERNAME="$2"
+PASSWORD="$3"
 
-echo "=== 开始安装 SOCKS5 服务 ==="
-
-# 1. 停止旧服务（如果存在）
-if systemctl is-active --quiet $SERVICE_NAME; then
-    echo "停止旧服务..."
-    systemctl stop $SERVICE_NAME
-    systemctl disable $SERVICE_NAME
+if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || [ "${PORT}" -lt 1 ] || [ "${PORT}" -gt 65535 ]; then
+  echo "Invalid port: ${PORT}" >&2
+  exit 1
 fi
 
-# 2. 下载二进制文件
-echo "正在从 GitHub 下载..."
-wget -O $INSTALL_PATH $DOWNLOAD_URL
-if [ $? -ne 0 ]; then
-    echo "下载失败，请检查 DOWNLOAD_URL 是否正确，或网络是否通畅。"
-    exit 1
+if [ -z "${USERNAME}" ] || [ -z "${PASSWORD}" ]; then
+  echo "Username and password cannot be empty." >&2
+  exit 1
 fi
 
-# 3. 赋予执行权限
-chmod +x $INSTALL_PATH
-echo "下载完成，已赋予执行权限。"
+if [[ "${USERNAME}" =~ [[:space:]] ]] || [[ "${PASSWORD}" =~ [[:space:]] ]]; then
+  echo "Username and password cannot contain whitespace." >&2
+  exit 1
+fi
 
-# 4. 创建 Systemd 服务文件
-echo "创建系统服务文件..."
-cat > /etc/systemd/system/${SERVICE_NAME}.service <<EOF
+if [ "${#USERNAME}" -gt 255 ] || [ "${#PASSWORD}" -gt 255 ]; then
+  echo "Username and password must be no longer than 255 bytes." >&2
+  exit 1
+fi
+
+echo "Installing SOCKS5 service..."
+echo "Service: ${SERVICE_NAME}"
+echo "Listen:  :${PORT}"
+
+if systemctl is-active --quiet "${SERVICE_NAME}"; then
+  systemctl stop "${SERVICE_NAME}"
+fi
+
+if systemctl is-enabled --quiet "${SERVICE_NAME}" 2>/dev/null; then
+  systemctl disable "${SERVICE_NAME}"
+fi
+
+echo "Downloading binary from ${DOWNLOAD_URL}"
+if command -v wget >/dev/null 2>&1; then
+  wget -qO "${INSTALL_PATH}" "${DOWNLOAD_URL}"
+elif command -v curl >/dev/null 2>&1; then
+  curl -fsSL "${DOWNLOAD_URL}" -o "${INSTALL_PATH}"
+else
+  echo "Neither wget nor curl is installed." >&2
+  exit 1
+fi
+
+chmod 0755 "${INSTALL_PATH}"
+
+cat >"${SERVICE_FILE}" <<EOF
 [Unit]
-Description=Simple SOCKS5 Server
-After=network.target
+Description=Lightweight SOCKS5 Server
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-# 这里的参数由脚本传入
-ExecStart=${INSTALL_PATH} -port ${PORT} -user ${USER} -pass ${PASS}
+ExecStart=${INSTALL_PATH} -addr :${PORT} -user ${USERNAME} -pass ${PASSWORD}
 Restart=always
 RestartSec=5s
 User=root
@@ -64,25 +87,19 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
 
-# 5. 重新加载并启动服务
-echo "配置开机自启并启动服务..."
 systemctl daemon-reload
-systemctl enable $SERVICE_NAME
-systemctl start $SERVICE_NAME
+systemctl enable "${SERVICE_NAME}"
+systemctl restart "${SERVICE_NAME}"
 
-# 6. 检查状态
-sleep 2
-if systemctl is-active --quiet $SERVICE_NAME; then
-    echo "=========================================="
-    echo "✅ 安装成功！SOCKS5 服务已在后台运行。"
-    echo "------------------------------------------"
-    echo "端口: ${PORT}"
-    echo "用户: ${USER}"
-    echo "密码: ${PASS}"
-    echo "------------------------------------------"
-    echo "查看日志: journalctl -u ${SERVICE_NAME} -f"
-    echo "停止服务: systemctl stop ${SERVICE_NAME}"
-    echo "=========================================="
+sleep 1
+if systemctl is-active --quiet "${SERVICE_NAME}"; then
+  echo "SOCKS5 service is running."
+  echo "Port: ${PORT}"
+  echo "User: ${USERNAME}"
+  echo "Status: systemctl status ${SERVICE_NAME}"
+  echo "Logs: journalctl -u ${SERVICE_NAME} -f"
 else
-    echo "❌ 启动失败，请检查日志: systemctl status ${SERVICE_NAME}"
+  echo "SOCKS5 service failed to start." >&2
+  echo "Check: systemctl status ${SERVICE_NAME}" >&2
+  exit 1
 fi
