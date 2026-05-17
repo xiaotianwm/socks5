@@ -45,9 +45,55 @@ if [ "${#USERNAME}" -gt 255 ] || [ "${#PASSWORD}" -gt 255 ]; then
   exit 1
 fi
 
+random_port() {
+  for _ in $(seq 1 80); do
+    local raw
+    raw="$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')"
+    local port=$((raw % 40000 + 20000))
+    if [ "${port}" = "${PORT}" ]; then
+      continue
+    fi
+    if command -v ss >/dev/null 2>&1 && ss -ltn | awk '{print $4}' | grep -q ":${port}$"; then
+      continue
+    fi
+    echo "${port}"
+    return 0
+  done
+  echo "Failed to choose an admin port." >&2
+  return 1
+}
+
+random_token() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 24
+    return 0
+  fi
+  od -An -N24 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+detect_host() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null && return 0
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO- --timeout=3 https://api.ipify.org 2>/dev/null && return 0
+  fi
+  hostname -I 2>/dev/null | awk '{print $1}'
+}
+
+ADMIN_PORT="${ADMIN_PORT:-$(random_port)}"
+ADMIN_TOKEN="${ADMIN_TOKEN:-$(random_token)}"
+HOST_IP="${HOST_IP:-$(detect_host)}"
+if [ -z "${HOST_IP}" ]; then
+  HOST_IP="<server-ip>"
+fi
+SYSTEMD_USERNAME="${USERNAME//%/%%}"
+SYSTEMD_PASSWORD="${PASSWORD//%/%%}"
+
 echo "Installing SOCKS5 service..."
 echo "Service: ${SERVICE_NAME}"
 echo "Listen:  :${PORT}"
+echo "Admin:   :${ADMIN_PORT}"
 
 if systemctl is-active --quiet "${SERVICE_NAME}"; then
   systemctl stop "${SERVICE_NAME}"
@@ -77,7 +123,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${INSTALL_PATH} -addr :${PORT} -user ${USERNAME} -pass ${PASSWORD}
+ExecStart=${INSTALL_PATH} -addr :${PORT} -user ${SYSTEMD_USERNAME} -pass ${SYSTEMD_PASSWORD} -admin :${ADMIN_PORT} -admin-token ${ADMIN_TOKEN}
 Restart=always
 RestartSec=5s
 User=root
@@ -94,10 +140,20 @@ systemctl restart "${SERVICE_NAME}"
 sleep 1
 if systemctl is-active --quiet "${SERVICE_NAME}"; then
   echo "SOCKS5 service is running."
-  echo "Port: ${PORT}"
-  echo "User: ${USERNAME}"
-  echo "Status: systemctl status ${SERVICE_NAME}"
-  echo "Logs: journalctl -u ${SERVICE_NAME} -f"
+  echo "=========================================="
+  echo "SOCKS5:"
+  echo "  host: ${HOST_IP}"
+  echo "  port: ${PORT}"
+  echo "  user: ${USERNAME}"
+  echo "  pass: ${PASSWORD}"
+  echo ""
+  echo "Admin Web:"
+  echo "  url: http://${HOST_IP}:${ADMIN_PORT}/?token=${ADMIN_TOKEN}"
+  echo ""
+  echo "Commands:"
+  echo "  status: systemctl status ${SERVICE_NAME}"
+  echo "  logs:   journalctl -u ${SERVICE_NAME} -f"
+  echo "=========================================="
 else
   echo "SOCKS5 service failed to start." >&2
   echo "Check: systemctl status ${SERVICE_NAME}" >&2
