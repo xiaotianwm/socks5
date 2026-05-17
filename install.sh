@@ -81,6 +81,29 @@ detect_host() {
   hostname -I 2>/dev/null | awk '{print $1}'
 }
 
+read_existing_admin() {
+  if [ ! -f "${SERVICE_FILE}" ]; then
+    return 0
+  fi
+  local line
+  line="$(grep -E '^ExecStart=' "${SERVICE_FILE}" | tail -n 1 || true)"
+  if [ -z "${line}" ]; then
+    return 0
+  fi
+  local existing_port
+  local existing_token
+  existing_port="$(printf '%s\n' "${line}" | sed -n 's/.*-admin[[:space:]]\+:\([0-9]\+\).*/\1/p')"
+  existing_token="$(printf '%s\n' "${line}" | sed -n 's/.*-admin-token[[:space:]]\+\([^[:space:]]\+\).*/\1/p')"
+  if [ -n "${existing_port}" ] && [ -z "${ADMIN_PORT:-}" ]; then
+    ADMIN_PORT="${existing_port}"
+  fi
+  if [ -n "${existing_token}" ] && [ -z "${ADMIN_TOKEN:-}" ]; then
+    ADMIN_TOKEN="${existing_token}"
+  fi
+}
+
+read_existing_admin
+
 ADMIN_PORT="${ADMIN_PORT:-$(random_port)}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-$(random_token)}"
 HOST_IP="${HOST_IP:-$(detect_host)}"
@@ -94,6 +117,9 @@ echo "Installing SOCKS5 service..."
 echo "Service: ${SERVICE_NAME}"
 echo "Listen:  :${PORT}"
 echo "Admin:   :${ADMIN_PORT}"
+if [ -f "${SERVICE_FILE}" ]; then
+  echo "Existing admin port/token will be reused when available."
+fi
 
 if systemctl is-active --quiet "${SERVICE_NAME}"; then
   systemctl stop "${SERVICE_NAME}"
